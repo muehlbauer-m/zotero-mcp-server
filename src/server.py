@@ -343,6 +343,103 @@ def get_item_fields(item_type: str) -> str:
 
 
 @mcp.tool()
+def get_fulltext_local(item_key: str) -> str:
+    """
+    Get full text content from local Zotero desktop (requires Zotero running).
+
+    Works with ZotMoov-managed files since Zotero indexes PDFs locally.
+
+    Args:
+        item_key: The Zotero item key
+
+    Returns:
+        Full text content or error message if not available
+    """
+    import requests
+    import fitz  # pymupdf
+
+    try:
+        # Step 1: Get item metadata from local API to find PDF path
+        response = requests.get(
+            f"http://localhost:23119/api/users/0/items/{item_key}",
+            timeout=10
+        )
+        response.raise_for_status()
+        item_data = response.json()
+
+        # Check if this is an attachment or parent item
+        item_type = item_data.get("data", {}).get("itemType", "")
+
+        if item_type == "attachment":
+            # This is the attachment itself
+            pdf_path = item_data.get("data", {}).get("path", "")
+        else:
+            # This is a parent item, need to find child attachments
+            children_response = requests.get(
+                f"http://localhost:23119/api/users/0/items/{item_key}/children",
+                timeout=10
+            )
+            children_response.raise_for_status()
+            children = children_response.json()
+
+            # Find PDF attachment
+            pdf_path = None
+            for child in children:
+                if child.get("data", {}).get("contentType") == "application/pdf":
+                    pdf_path = child.get("data", {}).get("path", "")
+                    break
+
+            if not pdf_path:
+                return json.dumps({
+                    "error": "No PDF attachment found for this item",
+                    "item_key": item_key
+                }, indent=2)
+
+        if not pdf_path:
+            return json.dumps({
+                "error": "No file path found in attachment metadata",
+                "item_key": item_key
+            }, indent=2)
+
+        # Step 2: Read PDF and extract text
+        try:
+            doc = fitz.open(pdf_path)
+            text_content = []
+            for page_num, page in enumerate(doc):
+                text_content.append(f"--- Page {page_num + 1} ---\n{page.get_text()}")
+            doc.close()
+
+            full_text = "\n\n".join(text_content)
+
+            return json.dumps({
+                "item_key": item_key,
+                "pdf_path": pdf_path,
+                "page_count": len(text_content),
+                "content": full_text
+            }, indent=2)
+
+        except Exception as pdf_error:
+            return json.dumps({
+                "error": f"Failed to read PDF: {str(pdf_error)}",
+                "pdf_path": pdf_path,
+                "note": "Ensure the file exists and is accessible"
+            }, indent=2)
+
+    except requests.exceptions.ConnectionError:
+        return json.dumps({
+            "error": "Cannot connect to Zotero local API",
+            "note": "Ensure Zotero desktop is running with local API enabled (Edit > Settings > Advanced > Allow other applications to communicate with Zotero)"
+        }, indent=2)
+    except requests.exceptions.HTTPError as e:
+        return json.dumps({
+            "error": f"HTTP error: {e.response.status_code}",
+            "note": "Item not found or API error"
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+
+@mcp.tool()
 def list_collections(parent_key: Optional[str] = None) -> str:
     """
     List all collections in the Zotero library.
