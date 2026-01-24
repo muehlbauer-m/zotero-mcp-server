@@ -342,6 +342,38 @@ def get_item_fields(item_type: str) -> str:
     return json.dumps(fields, indent=2)
 
 
+@mcp.tool()
+def list_collections(parent_key: Optional[str] = None) -> str:
+    """
+    List all collections in the Zotero library.
+
+    Args:
+        parent_key: Optional parent collection key to list only subcollections
+
+    Returns:
+        JSON string containing collections with their keys, names, and hierarchy
+    """
+    ensure_client()
+
+    if parent_key:
+        collections = zot.collections_sub(parent_key)
+    else:
+        collections = zot.collections()
+
+    # Simplify output for readability
+    result = []
+    for col in collections:
+        data = col.get('data', col)
+        result.append({
+            "key": data.get('key'),
+            "name": data.get('name'),
+            "parentCollection": data.get('parentCollection', False),
+            "numItems": col.get('meta', {}).get('numItems', 0)
+        })
+
+    return json.dumps(result, indent=2)
+
+
 def main():
     """Main entry point for the server."""
     logger.info("Starting Zotero MCP Server")
