@@ -122,6 +122,48 @@ def save_semantic_index(index: dict):
     logger.info(f"Saved semantic index with {len(index.get('items', {}))} items")
 
 
+def get_zotero_storage_path() -> str:
+    """
+    Get the Zotero storage path, supporting both ZotMoov and default locations.
+
+    Returns the storage path where Zotero/ZotMoov stores attachment files.
+    """
+    # Try ZotMoov first
+    try:
+        import os
+        prefs_path = Path.home() / "AppData" / "Roaming" / "Zotero" / "Zotero" / "Profiles"
+
+        # Find the profile directory (usually like r64lmnh5.default)
+        if prefs_path.exists():
+            for profile_dir in prefs_path.iterdir():
+                if profile_dir.is_dir():
+                    prefs_js = profile_dir / "prefs.js"
+                    if prefs_js.exists():
+                        with open(prefs_js, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            # Look for ZotMoov destination directory
+                            import re
+                            match = re.search(r'extensions\.zotmoov\.dst_dir["\s]*,\s*"([^"]+)"', content)
+                            if match:
+                                zotmoov_path = match.group(1)
+                                # Convert Windows path format
+                                zotmoov_path = zotmoov_path.replace('\\\\', '/').replace('\\', '/')
+                                if Path(zotmoov_path).exists():
+                                    logger.info(f"Using ZotMoov storage: {zotmoov_path}")
+                                    return zotmoov_path
+    except Exception as e:
+        logger.debug(f"Could not get ZotMoov path: {e}")
+
+    # Fall back to default Zotero storage location
+    default_path = Path.home() / "Zotero" / "storage"
+    if default_path.exists():
+        logger.info(f"Using default Zotero storage: {default_path}")
+        return str(default_path)
+
+    logger.warning("Could not find Zotero storage directory")
+    return None
+
+
 def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
     """
     Extract text from PDF with page tracking.
@@ -131,7 +173,27 @@ def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
     import fitz  # pymupdf
 
     try:
-        # Get item metadata from local API
+        # Try direct file access first (faster for ZotMoov and default storage)
+        storage_path = get_zotero_storage_path()
+        if storage_path:
+            import glob
+            pdf_files = glob.glob(str(Path(storage_path) / item_key / "*.pdf"))
+            if pdf_files:
+                try:
+                    doc = fitz.open(pdf_files[0])
+                    pages = []
+                    for page_num, page in enumerate(doc):
+                        text = page.get_text()
+                        if text.strip():
+                            pages.append({"page": page_num + 1, "text": text})
+                    doc.close()
+                    if pages:
+                        logger.debug(f"Extracted PDF for {item_key} from direct path")
+                        return pages
+                except Exception as e:
+                    logger.debug(f"Failed direct extraction for {item_key}: {e}")
+
+        # Fall back to Zotero API if direct access failed
         response = requests.get(
             f"http://localhost:23119/api/users/0/items/{item_key}",
             timeout=10
