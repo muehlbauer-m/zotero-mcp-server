@@ -177,7 +177,12 @@ def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
         storage_path = get_zotero_storage_path()
         if storage_path:
             import glob
+            # Try item_key subfolder first (default Zotero structure)
             pdf_files = glob.glob(str(Path(storage_path) / item_key / "*.pdf"))
+            # If not found, try flat structure (ZotMoov may store PDFs directly)
+            if not pdf_files:
+                pdf_files = glob.glob(str(Path(storage_path) / f"{item_key}*.pdf"))
+
             if pdf_files:
                 try:
                     doc = fitz.open(pdf_files[0])
