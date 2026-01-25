@@ -7,38 +7,32 @@ Built with the official [MCP Python SDK](https://github.com/modelcontextprotocol
 ## Features
 
 - Search for items in Zotero libraries
+- **Semantic search** - Find papers by meaning, not just keywords
 - Get citations and bibliographies
 - Add new items to Zotero libraries
 - Access collections and items
+- Extract full text from PDFs (requires Zotero desktop running)
 - Support for both personal and group libraries
 
 ## Installation
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/your-username/zotero-mcp-server.git
-   cd zotero-mcp-server
-   ```
+### Using uv (Recommended)
 
-2. Create a virtual environment:
-   ```bash
-   python -m venv venv
-   ```
+```bash
+git clone https://github.com/your-username/zotero-mcp-server.git
+cd zotero-mcp-server
+uv sync
+```
 
-3. Activate the virtual environment:
-   - On Linux/macOS:
-     ```bash
-     source venv/bin/activate
-     ```
-   - On Windows:
-     ```bash
-     venv\Scripts\activate
-     ```
+### Using pip
 
-4. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+git clone https://github.com/your-username/zotero-mcp-server.git
+cd zotero-mcp-server
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
 
 ## Configuration
 
@@ -94,15 +88,62 @@ The Zotero MCP server can be integrated with AI applications that support the Mo
 
 ## Available Tools
 
-- `search_items`: Search for items in the Zotero library
+### Library Management
+- `search_items`: Search for items in the Zotero library (keyword search)
+- `get_item`: Get full details of a specific item by key
 - `get_citation`: Get citation for a specific item
 - `add_item`: Add a new item to the Zotero library
 - `get_bibliography`: Get bibliography for multiple items
 - `create_collection`: Create a new collection in the Zotero library
+- `list_collections`: List all collections in the library
 - `update_item`: Update an existing item in the Zotero library
 - `delete_item`: Delete an item from the Zotero library
 - `get_item_types`: Get list of all available Zotero item types
 - `get_item_fields`: Get available fields for a specific item type
+
+### Full Text & Semantic Search
+- `get_fulltext_local`: Extract full text from a PDF (requires Zotero desktop running)
+- `build_semantic_index`: Build/update the semantic search index from your library
+- `semantic_search`: Search by meaning - returns matching text chunks with page numbers
+- `get_index_status`: Check the status of the semantic search index
+
+### Semantic Search Usage
+
+Semantic search lets you find papers by meaning rather than exact keywords. It uses the `all-MiniLM-L6-v2` embedding model (~80MB, runs locally on CPU).
+
+1. **Build the index** (first time, or after adding new papers):
+   ```
+   build_semantic_index()
+   ```
+   This extracts text from all PDFs, splits into chunks, and creates embeddings.
+   Takes a few minutes for a large library. Supports incremental updates.
+
+2. **Search semantically**:
+   ```
+   semantic_search("bootstrap methods for survey variance estimation")
+   ```
+   Returns the best-matching text chunk from each paper, showing WHY it matched:
+   ```json
+   {
+     "query": "bootstrap methods for survey variance estimation",
+     "results": [
+       {
+         "key": "S49V6LXJ",
+         "title": "A Bootstrap Variance Estimation Method...",
+         "score": 0.89,
+         "matched_chunk": "The Rao-Wu-Yue method is often used to produce bootstrap weights...",
+         "chunk_page": 3
+       }
+     ]
+   }
+   ```
+
+3. **Check index status**:
+   ```
+   get_index_status()
+   ```
+
+The index is stored at `~/.zotero-mcp/semantic_index.pkl`.
 
 ## Documentation
 

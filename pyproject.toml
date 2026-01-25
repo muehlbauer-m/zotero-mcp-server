@@ -1,0 +1,26 @@
+[project]
+name = "zotero-mcp-server"
+version = "0.1.0"
+description = "A Model Context Protocol server for Zotero integration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "mcp>=1.21.0",
+    "pyzotero>=1.5.5",
+    "python-dotenv>=0.19.0",
+    "requests>=2.26.0",
+    "pymupdf>=1.24.0",
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.21.0",
+]
+
+[project.scripts]
+zotero-mcp-server = "src.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
