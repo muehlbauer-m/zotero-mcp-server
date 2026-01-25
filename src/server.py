@@ -668,38 +668,53 @@ def list_collections(parent_key: Optional[str] = None) -> str:
 class ProgressWindow:
     """Simple progress window for long-running operations."""
     def __init__(self, title="Building Index"):
-        self.root = tk.Tk()
-        self.root.title(title)
-        self.root.geometry("500x200")
-        self.root.resizable(False, False)
+        try:
+            import os
+            # Check if we can create windows (need DISPLAY on Linux or Windows)
+            if os.environ.get('DISPLAY') == '' and sys.platform != 'win32':
+                logger.warning("No DISPLAY available - progress window disabled")
+                self.root = None
+                return
 
-        # Title
-        title_label = tk.Label(self.root, text=title, font=("Arial", 12, "bold"))
-        title_label.pack(pady=10)
+            self.root = tk.Tk()
+            self.root.title(title)
+            self.root.geometry("500x200")
+            self.root.resizable(False, False)
 
-        # Status text
-        self.status_label = tk.Label(self.root, text="Initializing...", wraplength=480)
-        self.status_label.pack(pady=5)
+            # Title
+            title_label = tk.Label(self.root, text=title, font=("Arial", 12, "bold"))
+            title_label.pack(pady=10)
 
-        # Progress bar
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(
-            self.root, variable=self.progress_var, maximum=100, mode='determinate'
-        )
-        self.progress_bar.pack(pady=10, padx=20, fill=tk.X)
+            # Status text
+            self.status_label = tk.Label(self.root, text="Initializing...", wraplength=480)
+            self.status_label.pack(pady=5)
 
-        # Details text
-        self.details_label = tk.Label(self.root, text="", fg="gray", wraplength=480)
-        self.details_label.pack(pady=5)
+            # Progress bar
+            self.progress_var = tk.DoubleVar()
+            self.progress_bar = ttk.Progressbar(
+                self.root, variable=self.progress_var, maximum=100, mode='determinate'
+            )
+            self.progress_bar.pack(pady=10, padx=20, fill=tk.X)
 
-        # Make window stay on top
-        self.root.attributes('-topmost', True)
+            # Details text
+            self.details_label = tk.Label(self.root, text="", fg="gray", wraplength=480)
+            self.details_label.pack(pady=5)
 
-        # Don't block - run in background
-        self.root.update_idletasks()
+            # Make window stay on top
+            self.root.attributes('-topmost', True)
+
+            # Don't block - run in background
+            self.root.update_idletasks()
+        except Exception as e:
+            logger.warning(f"Could not create progress window: {e}")
+            self.root = None
 
     def update(self, status: str, progress: float = None, details: str = ""):
         """Update progress window."""
+        if self.root is None:
+            logger.info(f"{status} {details}".strip())
+            return
+
         try:
             self.status_label.config(text=status)
             if details:
@@ -712,6 +727,9 @@ class ProgressWindow:
 
     def close(self):
         """Close the progress window."""
+        if self.root is None:
+            return
+
         try:
             self.root.destroy()
         except Exception as e:
