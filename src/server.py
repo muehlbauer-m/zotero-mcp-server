@@ -670,6 +670,11 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     Extracts text from all PDFs, splits into chunks, and creates embeddings.
     Requires Zotero desktop to be running with local API enabled.
 
+    This operation can take 5-30 minutes depending on library size and PDF count.
+    - First run: Downloads ~80MB embedding model
+    - PDF extraction: ~1-5 min per 100 PDFs
+    - Embedding: ~5-10 min per 1000 chunks
+
     Args:
         force_rebuild: If True, rebuild entire index. If False, only update changed items.
 
@@ -681,16 +686,25 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
 
     start_time = time.time()
     stats = {"items_processed": 0, "items_skipped": 0, "items_failed": 0,
-             "chunks_created": 0, "errors": []}
+             "chunks_created": 0, "errors": [], "status_messages": []}
 
     try:
         # Get all items from local Zotero API
+        # Local API has a ~40 item limit per request
         response = requests.get(
-            "http://localhost:23119/api/users/0/items?limit=10000",
+            "http://localhost:23119/api/users/0/items?limit=40",
             timeout=30
         )
         response.raise_for_status()
         all_items = response.json()
+
+        logger.info(f"Fetched {len(all_items)} items from Zotero")
+
+        # Check if there are more items via Total-Results header
+        total_results = int(response.headers.get("Total-Results", len(all_items)))
+        if len(all_items) < total_results:
+            logger.warning(f"Only fetched {len(all_items)} of {total_results} items. "
+                          "Zotero local API pagination is limited.")
     except requests.exceptions.ConnectionError:
         return json.dumps({
             "error": "Cannot connect to Zotero local API",
@@ -711,13 +725,20 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     if force_rebuild:
         index["items"] = {}
 
-    # Get embedding model
+    # Get embedding model (this may download ~80MB on first run)
+    logger.info("Loading embedding model (may take 1-2 minutes on first run)...")
+    stats["status_messages"].append("LOADING MODEL: all-MiniLM-L6-v2 (~80MB, first run only)")
     model = get_embedding_model()
+    stats["status_messages"].append("MODEL LOADED: Ready to extract and embed PDFs")
+    logger.info("Embedding model loaded successfully")
 
     # Track current item keys for cleanup
     current_keys = set()
+    total_to_process = len([i for i in parent_items
+                           if not (index["items"].get(i.get("key"), {}).get("version") == i.get("version")
+                                  and not force_rebuild)])
 
-    for item in parent_items:
+    for idx, item in enumerate(parent_items):
         item_key = item.get("key")
         item_data = item.get("data", {})
         item_version = item.get("version", 0)
@@ -775,8 +796,11 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
             stats["items_processed"] += 1
             stats["chunks_created"] += len(chunks)
 
-            if stats["items_processed"] % 10 == 0:
-                logger.info(f"Indexed {stats['items_processed']} items...")
+            if stats["items_processed"] % 5 == 0:
+                elapsed = time.time() - start_time
+                msg = f"PROGRESS: {stats['items_processed']} items indexed, {stats['chunks_created']} chunks, {elapsed:.0f}s elapsed"
+                logger.info(msg)
+                stats["status_messages"].append(msg)
 
         except Exception as e:
             stats["items_failed"] += 1
@@ -799,6 +823,10 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     stats["total_chunks_in_index"] = sum(
         len(item["chunks"]) for item in index["items"].values()
     )
+
+    final_msg = f"COMPLETED: Indexed {stats['items_processed']} items with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s"
+    stats["status_messages"].append(final_msg)
+    logger.info(final_msg)
 
     return json.dumps(stats, indent=2)
 
