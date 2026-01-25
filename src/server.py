@@ -131,8 +131,8 @@ def search_items(
     Search for items in the Zotero library.
 
     Args:
-        query: Search query string
-        collection_key: Optional collection key to search within
+        query: Search query string (use empty string "" to list all items)
+        collection_key: Optional collection key to search/list within
         limit: Maximum number of results to return (default: 20)
 
     Returns:
@@ -140,20 +140,47 @@ def search_items(
     """
     ensure_client()
 
-    search_params = {"q": query, "limit": limit}
-
     if collection_key:
-        items = zot.collection_items_top(collection_key, **search_params)
+        if query and query != "*":
+            # Search within collection
+            search_params = {"q": query, "limit": limit}
+            items = zot.collection_items_top(collection_key, **search_params)
+        else:
+            # List all items in collection (no search query)
+            items = zot.collection_items(collection_key, limit=limit)
     else:
-        items = zot.items(**search_params)
+        if query and query != "*":
+            # Search entire library
+            search_params = {"q": query, "limit": limit}
+            items = zot.items(**search_params)
+        else:
+            # List recent items (no search query)
+            items = zot.items(limit=limit)
 
     result = {
         "query": query,
+        "collection_key": collection_key,
         "count": len(items),
         "results": items
     }
 
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_item(item_key: str) -> str:
+    """
+    Get full details of a specific item by its key.
+
+    Args:
+        item_key: The Zotero item key
+
+    Returns:
+        JSON string containing item data
+    """
+    ensure_client()
+    item = zot.item(item_key)
+    return json.dumps(item, indent=2)
 
 
 @mcp.tool()
@@ -281,12 +308,15 @@ def update_item(
     # Get the existing item
     item = zot.item(item_key)
 
-    # Update fields
-    for key, value in updates.items():
-        item[key] = value
+    # Extract just the data portion (API returns library, meta, links, data)
+    item_data = item.get('data', item)
 
-    # Update the item
-    response = zot.update_item(item)
+    # Update fields in data
+    for key, value in updates.items():
+        item_data[key] = value
+
+    # Update the item (pyzotero expects the data dict)
+    response = zot.update_item(item_data)
     return json.dumps(response, indent=2)
 
 
