@@ -18,6 +18,9 @@ from dotenv import load_dotenv
 from pyzotero import zotero
 from mcp.server.fastmcp import FastMCP
 import numpy as np
+import tkinter as tk
+from tkinter import ttk
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -662,6 +665,59 @@ def list_collections(parent_key: Optional[str] = None) -> str:
 # SEMANTIC SEARCH TOOLS
 # ============================================================================
 
+class ProgressWindow:
+    """Simple progress window for long-running operations."""
+    def __init__(self, title="Building Index"):
+        self.root = tk.Tk()
+        self.root.title(title)
+        self.root.geometry("500x200")
+        self.root.resizable(False, False)
+
+        # Title
+        title_label = tk.Label(self.root, text=title, font=("Arial", 12, "bold"))
+        title_label.pack(pady=10)
+
+        # Status text
+        self.status_label = tk.Label(self.root, text="Initializing...", wraplength=480)
+        self.status_label.pack(pady=5)
+
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(
+            self.root, variable=self.progress_var, maximum=100, mode='determinate'
+        )
+        self.progress_bar.pack(pady=10, padx=20, fill=tk.X)
+
+        # Details text
+        self.details_label = tk.Label(self.root, text="", fg="gray", wraplength=480)
+        self.details_label.pack(pady=5)
+
+        # Make window stay on top
+        self.root.attributes('-topmost', True)
+
+        # Don't block - run in background
+        self.root.update_idletasks()
+
+    def update(self, status: str, progress: float = None, details: str = ""):
+        """Update progress window."""
+        try:
+            self.status_label.config(text=status)
+            if details:
+                self.details_label.config(text=details)
+            if progress is not None:
+                self.progress_var.set(progress)
+            self.root.update_idletasks()
+        except Exception as e:
+            logger.error(f"Error updating progress window: {e}")
+
+    def close(self):
+        """Close the progress window."""
+        try:
+            self.root.destroy()
+        except Exception as e:
+            logger.error(f"Error closing progress window: {e}")
+
+
 @mcp.tool()
 def build_semantic_index(force_rebuild: bool = False) -> str:
     """
@@ -687,6 +743,14 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     start_time = time.time()
     stats = {"items_processed": 0, "items_skipped": 0, "items_failed": 0,
              "chunks_created": 0, "errors": [], "status_messages": []}
+
+    # Create progress window
+    try:
+        progress_win = ProgressWindow("Building Semantic Index")
+        progress_win.update("Fetching items from Zotero...", 0)
+    except Exception as e:
+        logger.warning(f"Could not create progress window: {e}")
+        progress_win = None
 
     try:
         # Get all items from local Zotero API
@@ -727,9 +791,12 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
 
     # Get embedding model (this may download ~80MB on first run)
     logger.info("Loading embedding model (may take 1-2 minutes on first run)...")
-    stats["status_messages"].append("LOADING MODEL: all-MiniLM-L6-v2 (~80MB, first run only)")
+    if progress_win:
+        progress_win.update("Loading embedding model (~80MB on first run)...", 5,
+                           "This may take 1-2 minutes the first time")
     model = get_embedding_model()
-    stats["status_messages"].append("MODEL LOADED: Ready to extract and embed PDFs")
+    if progress_win:
+        progress_win.update("Model loaded! Starting PDF extraction...", 10)
     logger.info("Embedding model loaded successfully")
 
     # Track current item keys for cleanup
@@ -742,9 +809,18 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
         item_key = item.get("key")
         item_data = item.get("data", {})
         item_version = item.get("version", 0)
-        title = item_data.get("title", "Untitled")
+        title = item_data.get("title", "Untitled")[:50]  # Truncate for display
 
         current_keys.add(item_key)
+
+        # Update progress
+        progress_pct = 10 + (idx / len(parent_items)) * 85  # 10-95% for processing
+        if progress_win:
+            progress_win.update(
+                f"Processing: {idx + 1}/{len(parent_items)} items",
+                progress_pct,
+                f"{title}..."
+            )
 
         # Check if item needs updating
         existing = index["items"].get(item_key)
@@ -827,6 +903,13 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     final_msg = f"COMPLETED: Indexed {stats['items_processed']} items with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s"
     stats["status_messages"].append(final_msg)
     logger.info(final_msg)
+
+    # Close progress window
+    if progress_win:
+        progress_win.update("Complete!", 100)
+        import time as time_mod
+        time_mod.sleep(1)  # Show completion for 1 second
+        progress_win.close()
 
     return json.dumps(stats, indent=2)
 
