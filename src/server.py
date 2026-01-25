@@ -805,6 +805,10 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
                            if not (index["items"].get(i.get("key"), {}).get("version") == i.get("version")
                                   and not force_rebuild)])
 
+    # Track PDF extraction progress
+    pdfs_extracted = 0
+    pdfs_with_text = 0
+
     for idx, item in enumerate(parent_items):
         item_key = item.get("key")
         item_data = item.get("data", {})
@@ -829,6 +833,13 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
             continue
 
         # Extract PDF text
+        pdfs_extracted += 1
+        if progress_win:
+            progress_win.update(
+                f"Extracting PDF: {idx + 1}/{len(parent_items)} items ({pdfs_with_text} with text)",
+                progress_pct,
+                f"{title}..."
+            )
         pages = extract_pdf_text_with_pages(item_key)
         if not pages:
             # Index metadata only (title + abstract)
@@ -841,6 +852,7 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
                       "page": 0, "char_start": 0}]
         else:
             # Chunk the PDF text
+            pdfs_with_text += 1
             abstract = item_data.get("abstractNote", "")
             chunks = chunk_text_with_pages(pages, title, abstract)
 
@@ -899,8 +911,10 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     stats["total_chunks_in_index"] = sum(
         len(item["chunks"]) for item in index["items"].values()
     )
+    stats["pdfs_attempted"] = pdfs_extracted
+    stats["pdfs_with_text"] = pdfs_with_text
 
-    final_msg = f"COMPLETED: Indexed {stats['items_processed']} items with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s"
+    final_msg = f"COMPLETED: Indexed {stats['items_processed']} items ({pdfs_with_text} PDFs) with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s"
     stats["status_messages"].append(final_msg)
     logger.info(final_msg)
 
