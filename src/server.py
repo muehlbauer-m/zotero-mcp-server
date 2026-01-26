@@ -19,11 +19,25 @@ from pyzotero import zotero
 from mcp.server.fastmcp import FastMCP
 import numpy as np
 
-# Configure logging
+# Set environment variables BEFORE importing sentence_transformers
+# These prevent progress bars and warnings that can slow down MCP subprocess
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+# Import sentence_transformers at module level (slow in MCP subprocess, but only once at startup)
+from sentence_transformers import SentenceTransformer
+
+# Configure logging - both stderr and file
+LOG_FILE = Path.home() / ".zotero-mcp" / "server.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stderr
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(LOG_FILE, encoding='utf-8')
+    ]
 )
 logger = logging.getLogger('zotero-mcp-server')
 
@@ -82,9 +96,9 @@ def get_embedding_model():
     """Lazy-load the sentence transformer model."""
     global _embedding_model
     if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer
-        logger.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        logger.info(f"Loading model: {EMBEDDING_MODEL_NAME}")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
+        logger.info("Model loaded successfully")
     return _embedding_model
 
 
@@ -119,15 +133,24 @@ def save_semantic_index(index: dict):
     logger.info(f"Saved semantic index with {len(index.get('items', {}))} items")
 
 
+# Cache for storage path (avoid repeated lookups)
+_cached_storage_path: Optional[str] = None
+
+
 def get_zotero_storage_path() -> str:
     """
     Get the Zotero storage path, supporting both ZotMoov and default locations.
 
     Returns the storage path where Zotero/ZotMoov stores attachment files.
+    Uses caching to avoid repeated lookups.
     """
+    global _cached_storage_path
+    if _cached_storage_path is not None:
+        return _cached_storage_path
+
     # Try ZotMoov first
     try:
-        import os
+        import re
         prefs_path = Path.home() / "AppData" / "Roaming" / "Zotero" / "Zotero" / "Profiles"
 
         # Find the profile directory (usually like r64lmnh5.default)
@@ -139,7 +162,6 @@ def get_zotero_storage_path() -> str:
                         with open(prefs_js, 'r', encoding='utf-8', errors='ignore') as f:
                             content = f.read()
                             # Look for ZotMoov destination directory
-                            import re
                             match = re.search(r'extensions\.zotmoov\.dst_dir["\s]*,\s*"([^"]+)"', content)
                             if match:
                                 zotmoov_path = match.group(1)
@@ -147,6 +169,7 @@ def get_zotero_storage_path() -> str:
                                 zotmoov_path = zotmoov_path.replace('\\\\', '/').replace('\\', '/')
                                 if Path(zotmoov_path).exists():
                                     logger.info(f"Using ZotMoov storage: {zotmoov_path}")
+                                    _cached_storage_path = zotmoov_path
                                     return zotmoov_path
     except Exception as e:
         logger.debug(f"Could not get ZotMoov path: {e}")
@@ -155,47 +178,224 @@ def get_zotero_storage_path() -> str:
     default_path = Path.home() / "Zotero" / "storage"
     if default_path.exists():
         logger.info(f"Using default Zotero storage: {default_path}")
-        return str(default_path)
+        _cached_storage_path = str(default_path)
+        return _cached_storage_path
 
     logger.warning("Could not find Zotero storage directory")
     return None
 
 
-def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
+# Cache for PDF file list (to avoid repeated network scans)
+_pdf_file_cache: Optional[dict] = None  # {normalized_name: full_path}
+
+
+def _get_pdf_cache(storage_path: str) -> dict:
     """
-    Extract text from PDF with page tracking.
-    Returns list of {"page": N, "text": "..."} or None if no PDF.
+    Build/return a cache of all PDFs in the storage folder.
+    Keys are normalized filenames (lowercase, no extension) for matching.
     """
-    import requests
+    global _pdf_file_cache
+    if _pdf_file_cache is not None:
+        return _pdf_file_cache
+
+    import glob
+    logger.info(f"Building PDF file cache from {storage_path}...")
+
+    _pdf_file_cache = {}
+
+    # Try flat structure first (ZotMoov default)
+    pdf_files = glob.glob(str(Path(storage_path) / "*.pdf"))
+    logger.info(f"Found {len(pdf_files)} PDFs in root folder")
+
+    # Also try recursive search (in case of subfolders)
+    if not pdf_files:
+        logger.info("No PDFs in root, trying recursive search...")
+        pdf_files = glob.glob(str(Path(storage_path) / "**" / "*.pdf"), recursive=True)
+        logger.info(f"Found {len(pdf_files)} PDFs recursively")
+
+    for pdf_path in pdf_files:
+        filename = Path(pdf_path).stem.lower()  # filename without extension, lowercase
+        _pdf_file_cache[filename] = pdf_path
+
+    logger.info(f"PDF cache built: {len(_pdf_file_cache)} files indexed")
+
+    # Log first 3 files for debugging
+    if _pdf_file_cache:
+        sample = list(_pdf_file_cache.keys())[:3]
+        logger.info(f"Sample filenames: {sample}")
+
+    return _pdf_file_cache
+
+
+def _normalize_for_matching(text: str) -> str:
+    """Normalize text for fuzzy matching: lowercase, remove special chars."""
+    import re
+    # Lowercase and remove special characters except spaces
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def find_pdf_path_for_item(item_key: str, storage_path: str, title: str = "") -> Optional[str]:
+    """
+    Find the PDF path for an item.
+    Returns the path if found, None otherwise.
+
+    Supports:
+    - Default Zotero structure: storage_path/ITEM_KEY/filename.pdf
+    - ZotMoov with any renaming pattern: matches by title in filename
+    """
+    import glob
+    import os
+
+    # Debug: log what we received
+    logger.info(f"find_pdf_path_for_item called: key={item_key}, title_len={len(title) if title else 0}, title={title[:30] if title else 'EMPTY'}...")
+
+    if not storage_path:
+        logger.debug(f"No storage path provided for {item_key}")
+        return None
+
+    # Normalize path for Windows
+    normalized_storage = os.path.normpath(storage_path)
+
+    # Try item_key subfolder first (default Zotero structure)
+    subfolder_pattern = os.path.join(normalized_storage, item_key, "*.pdf")
+    pdf_files = glob.glob(subfolder_pattern)
+    if pdf_files:
+        logger.info(f"Found PDF in subfolder for {item_key}")
+        return pdf_files[0]
+
+    # Subfolder check failed, try title matching
+    logger.info(f"No subfolder match for {item_key}, trying title match. title='{title[:30] if title else 'EMPTY'}'")
+
+    # Try ZotMoov: match by title in filename
+    if title:
+        logger.info(f"Entering title matching block for {item_key}")
+        pdf_cache = _get_pdf_cache(normalized_storage)
+        normalized_title = _normalize_for_matching(title)
+
+        # Try to find a PDF whose filename contains a significant part of the title
+        # Use first 40 chars of title (truncated titles are common in filenames)
+        title_words = normalized_title.split()
+
+        best_match = None
+        best_score = 0
+
+        for cached_name, pdf_path in pdf_cache.items():
+            normalized_cached = _normalize_for_matching(cached_name)
+
+            # Count how many title words appear in the filename
+            matching_words = sum(1 for word in title_words if len(word) > 3 and word in normalized_cached)
+
+            # Require at least 3 matching words (to avoid false positives)
+            if matching_words >= 3 and matching_words > best_score:
+                best_score = matching_words
+                best_match = pdf_path
+
+        if best_match:
+            return best_match
+
+    return None
+
+
+def download_pdfs_to_temp(items_to_index: list, storage_path: str, progress_callback=None) -> tuple[Path, dict]:
+    """
+    Download PDFs for items that need indexing to a local temp folder.
+
+    Args:
+        items_to_index: List of (item_key, title) tuples for items needing indexing
+        storage_path: The Zotero/ZotMoov storage path
+        progress_callback: Optional callback(current, total, title) for progress updates
+
+    Returns:
+        Tuple of (temp_folder_path, {item_key: local_pdf_path} mapping)
+    """
+    import shutil
+    import tempfile
+
+    # Create temp folder
+    temp_dir = Path(tempfile.gettempdir()) / "zotero-pdf-cache"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_mapping = {}
+    total = len(items_to_index)
+    found_count = 0
+    not_found_count = 0
+
+    logger.info(f"Starting download of {total} items from storage: {storage_path}")
+
+    # Debug: show first few items to verify titles are present
+    if items_to_index:
+        for i, item in enumerate(items_to_index[:3]):
+            logger.info(f"  Sample item {i}: key={item[0]}, title='{item[1]}'")
+
+    for idx, (item_key, title) in enumerate(items_to_index):
+        if progress_callback:
+            progress_callback(idx + 1, total, f"Downloading: {title[:40]}")
+
+        # Find PDF on network (match by title since ZotMoov renames files)
+        source_pdf = find_pdf_path_for_item(item_key, storage_path, title)
+        if not source_pdf:
+            not_found_count += 1
+            if idx < 5:  # Log first few for debugging
+                logger.info(f"No PDF found for {item_key}: {title[:40]}")
+            continue
+        found_count += 1
+        if idx < 5:  # Log first few for debugging
+            logger.info(f"Found PDF for {item_key}: {source_pdf}")
+
+        # Copy to temp folder
+        dest_pdf = temp_dir / f"{item_key}.pdf"
+        try:
+            if not dest_pdf.exists():  # Don't re-copy if already there
+                shutil.copy2(source_pdf, dest_pdf)
+            pdf_mapping[item_key] = str(dest_pdf)
+            logger.debug(f"Downloaded {item_key} to temp folder")
+        except Exception as e:
+            logger.warning(f"Failed to copy PDF for {item_key}: {e}")
+
+    logger.info(f"Download complete: {found_count} PDFs found, {not_found_count} not found, {len(pdf_mapping)} copied to {temp_dir}")
+    return temp_dir, pdf_mapping
+
+
+def extract_pdf_text_from_path(pdf_path: str) -> Optional[list[dict]]:
+    """
+    Extract text from a PDF file at the given path.
+    Returns list of {"page": N, "text": "..."} or None if extraction fails.
+    """
     import fitz  # pymupdf
 
     try:
-        # Try direct file access first (faster for ZotMoov and default storage)
-        storage_path = get_zotero_storage_path()
-        if storage_path:
-            import glob
-            # Try item_key subfolder first (default Zotero structure)
-            pdf_files = glob.glob(str(Path(storage_path) / item_key / "*.pdf"))
-            # If not found, try flat structure (ZotMoov may store PDFs directly)
-            if not pdf_files:
-                pdf_files = glob.glob(str(Path(storage_path) / f"{item_key}*.pdf"))
+        doc = fitz.open(pdf_path)
+        pages = []
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            if text.strip():
+                pages.append({"page": page_num + 1, "text": text})
+        doc.close()
+        return pages if pages else None
+    except Exception as e:
+        logger.debug(f"Failed to extract PDF from {pdf_path}: {e}")
+        return None
 
-            if pdf_files:
-                try:
-                    doc = fitz.open(pdf_files[0])
-                    pages = []
-                    for page_num, page in enumerate(doc):
-                        text = page.get_text()
-                        if text.strip():
-                            pages.append({"page": page_num + 1, "text": text})
-                    doc.close()
-                    if pages:
-                        logger.debug(f"Extracted PDF for {item_key} from direct path")
-                        return pages
-                except Exception as e:
-                    logger.debug(f"Failed direct extraction for {item_key}: {e}")
 
-        # Fall back to Zotero API if direct access failed
+def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
+    """
+    Extract text from PDF with page tracking (used by get_fulltext_local tool).
+    Returns list of {"page": N, "text": "..."} or None if no PDF.
+    """
+    # Try direct file access first
+    storage_path = get_zotero_storage_path()
+    if storage_path:
+        pdf_path = find_pdf_path_for_item(item_key, storage_path)
+        if pdf_path:
+            return extract_pdf_text_from_path(pdf_path)
+
+    # Fall back to Zotero local API
+    import requests
+    try:
         response = requests.get(
             f"http://localhost:23119/api/users/0/items/{item_key}",
             timeout=10
@@ -222,23 +422,13 @@ def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
                     pdf_path = child.get("data", {}).get("path", "")
                     break
 
-        if not pdf_path:
-            return None
-
-        # Extract text page by page
-        doc = fitz.open(pdf_path)
-        pages = []
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            if text.strip():
-                pages.append({"page": page_num + 1, "text": text})
-        doc.close()
-
-        return pages if pages else None
+        if pdf_path:
+            return extract_pdf_text_from_path(pdf_path)
 
     except Exception as e:
         logger.debug(f"Failed to extract PDF for {item_key}: {e}")
-        return None
+
+    return None
 
 
 def chunk_text_with_pages(pages: list[dict], title: str, abstract: str,
@@ -729,29 +919,220 @@ def list_collections(parent_key: Optional[str] = None) -> str:
 # SEMANTIC SEARCH TOOLS
 # ============================================================================
 
-class ProgressReporter:
-    """Progress reporter using simple logging - works in all environments."""
-    def __init__(self, title="Building Index"):
+class SimpleMessageWindow:
+    """
+    Simple message window that displays a status message.
+    Used for showing "Loading model..." before the main progress window.
+    """
+    def __init__(self, title="Please Wait", message="Loading..."):
+        import threading
+
         self.title = title
+        self.message = message
+        self.closed = False
+        self.root = None
+
+        logger.info(f"{title}: {message}")
+
+        # Start tkinter in separate thread
+        self.thread = threading.Thread(target=self._run_window, daemon=True)
+        self.thread.start()
+
+        # Give window time to initialize
+        import time
+        time.sleep(0.3)
+
+    def _run_window(self):
+        """Run tkinter window in its own thread."""
+        try:
+            import tkinter as tk
+
+            self.root = tk.Tk()
+            self.root.title(self.title)
+            self.root.geometry("400x100")
+            self.root.resizable(False, False)
+
+            # Message
+            label = tk.Label(self.root, text=self.message, font=("Arial", 12))
+            label.pack(expand=True)
+
+            # Keep window on top
+            self.root.attributes('-topmost', True)
+            self.root.lift()
+
+            # Handle window close
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            # Run tkinter event loop
+            self.root.mainloop()
+
+        except Exception as e:
+            logger.warning(f"Could not create message window: {e}")
+            self.root = None
+
+    def _on_close(self):
+        """Handle window close button."""
+        self.closed = True
+        if self.root:
+            self.root.destroy()
+
+    def close(self):
+        """Close the window."""
+        self.closed = True
+        if self.root:
+            try:
+                self.root.after(0, self.root.destroy)
+            except:
+                pass
+
+        # Give window time to close
+        import time
+        time.sleep(0.1)
+
+
+class ProgressWindow:
+    """
+    Progress window using tkinter that runs in a separate thread.
+    Thread-safe updates via queue mechanism.
+    """
+    def __init__(self, title="Building Index"):
+        import threading
+        import queue
+
+        self.title = title
+        self.queue = queue.Queue()
+        self.closed = False
+        self.thread = None
+        self.root = None
+
+        # Also log to console
         logger.info(f"\n{'='*60}")
         logger.info(f"  {title}")
         logger.info(f"{'='*60}\n")
 
+        # Start tkinter in separate thread
+        self.thread = threading.Thread(target=self._run_window, daemon=True)
+        self.thread.start()
+
+        # Give window time to initialize
+        import time
+        time.sleep(0.3)
+
+    def _run_window(self):
+        """Run tkinter window in its own thread with event loop."""
+        try:
+            import tkinter as tk
+            from tkinter import ttk
+
+            self.root = tk.Tk()
+            self.root.title(self.title)
+            self.root.geometry("500x180")
+            self.root.resizable(False, False)
+
+            # Title
+            title_label = tk.Label(self.root, text=self.title, font=("Arial", 14, "bold"))
+            title_label.pack(pady=(15, 10))
+
+            # Status text
+            self.status_var = tk.StringVar(value="Initializing...")
+            status_label = tk.Label(self.root, textvariable=self.status_var, font=("Arial", 10))
+            status_label.pack(pady=5)
+
+            # Progress bar
+            self.progress_var = tk.DoubleVar(value=0)
+            progress_bar = ttk.Progressbar(
+                self.root, variable=self.progress_var, maximum=100, mode='determinate', length=450
+            )
+            progress_bar.pack(pady=10, padx=25)
+
+            # Details text (item name)
+            self.details_var = tk.StringVar(value="")
+            details_label = tk.Label(self.root, textvariable=self.details_var, fg="gray", font=("Arial", 9))
+            details_label.pack(pady=5)
+
+            # Keep window on top
+            self.root.attributes('-topmost', True)
+            self.root.lift()
+
+            # Handle window close
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+            # Start polling queue for updates
+            self._poll_queue()
+
+            # Run tkinter event loop
+            self.root.mainloop()
+
+        except Exception as e:
+            logger.warning(f"Could not create progress window: {e}")
+            self.root = None
+
+    def _poll_queue(self):
+        """Poll queue for updates (runs in tkinter thread)."""
+        if self.closed or self.root is None:
+            return
+
+        try:
+            while True:
+                try:
+                    msg = self.queue.get_nowait()
+                    if msg.get("close"):
+                        self.root.destroy()
+                        return
+                    if "status" in msg:
+                        self.status_var.set(msg["status"])
+                    if "progress" in msg:
+                        self.progress_var.set(msg["progress"])
+                    if "details" in msg:
+                        self.details_var.set(msg["details"])
+                except:
+                    break
+
+            # Schedule next poll (every 50ms)
+            self.root.after(50, self._poll_queue)
+        except Exception as e:
+            logger.debug(f"Poll queue error: {e}")
+
+    def _on_close(self):
+        """Handle window close button."""
+        self.closed = True
+        if self.root:
+            self.root.destroy()
+
     def update(self, current: int, total: int, item_name: str = ""):
-        """Log progress update with current/total count."""
+        """Send progress update to window (thread-safe)."""
         pct = int((current / total) * 100) if total > 0 else 0
+
+        # Log to console too
         bar_length = 30
         filled = int(bar_length * current // total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_length - filled)
-
         msg = f"[{bar}] {current}/{total} ({pct}%)"
         if item_name:
             msg += f" - {item_name[:40]}"
         logger.info(msg)
 
+        # Send to window
+        self.queue.put({
+            "status": f"Processing {current} of {total} items ({pct}%)",
+            "progress": pct,
+            "details": item_name[:60] if item_name else ""
+        })
+
+    def set_status(self, status: str):
+        """Set status message (thread-safe)."""
+        logger.info(status)
+        self.queue.put({"status": status})
+
     def close(self):
-        """Log completion."""
+        """Close the progress window."""
         logger.info(f"\n{'='*60}\n")
+        self.closed = True
+        self.queue.put({"close": True})
+
+        # Give window time to close
+        import time
+        time.sleep(0.1)
 
 
 @mcp.tool()
@@ -760,12 +1141,12 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     Build or update the semantic search index from local Zotero library.
 
     Extracts text from all PDFs, splits into chunks, and creates embeddings.
-    Requires Zotero desktop to be running with local API enabled.
+    PDFs are first downloaded to a local temp folder for faster extraction.
 
     This operation can take 5-30 minutes depending on library size and PDF count.
     - First run: Downloads ~80MB embedding model
-    - PDF extraction: ~1-5 min per 100 PDFs
-    - Embedding: ~5-10 min per 1000 chunks
+    - PDF download: Copies PDFs from network to local temp folder
+    - PDF extraction + embedding: Much faster from local storage
 
     Args:
         force_rebuild: If True, rebuild entire index. If False, only update changed items.
@@ -773,40 +1154,46 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     Returns:
         JSON with indexing statistics
     """
-    import requests
+    import shutil
     import time
 
     start_time = time.time()
     stats = {"items_processed": 0, "items_skipped": 0, "items_failed": 0,
-             "chunks_created": 0, "errors": [], "status_messages": []}
+             "chunks_created": 0, "errors": [], "status_messages": [],
+             "pdfs_downloaded": 0, "download_time": 0, "extract_time": 0, "embed_time": 0}
 
-    # Create progress reporter
-    progress = ProgressReporter("Building Semantic Index")
-    logger.info("Fetching items from Zotero...")
+    # Load embedding model FIRST (no GUI - tkinter threads cause ~10x slowdown)
+    logger.info("=" * 60)
+    logger.info("Loading embedding model (this may take 20-30 seconds on first run)...")
+    print("Loading embedding model, please wait...", flush=True)
+    model_start = time.time()
+    model = get_embedding_model()
+    model_load_time = time.time() - model_start
+    logger.info(f"Model loaded in {model_load_time:.1f}s")
+    print(f"Model loaded in {model_load_time:.1f}s", flush=True)
+
+    # Create progress window (runs in separate thread)
+    progress = ProgressWindow("Building Semantic Index")
+    progress.set_status("Fetching items from Zotero...")
 
     try:
-        # Get all items from local Zotero API
-        # Local API has a ~40 item limit per request
-        response = requests.get(
-            "http://localhost:23119/api/users/0/items?limit=40",
-            timeout=30
-        )
-        response.raise_for_status()
-        all_items = response.json()
+        # Use pyzotero to get all items (handles pagination automatically)
+        if zot is None:
+            init_zotero_client()
+        ensure_client()
 
+        progress.set_status("Fetching all items from Zotero...")
+        # zot.everything() handles pagination, zot.top() gets parent items only
+        all_items = zot.everything(zot.top())
         logger.info(f"Fetched {len(all_items)} items from Zotero")
-
-        # Check if there are more items via Total-Results header
-        total_results = int(response.headers.get("Total-Results", len(all_items)))
-        if len(all_items) < total_results:
-            logger.warning(f"Only fetched {len(all_items)} of {total_results} items. "
-                          "Zotero local API pagination is limited.")
-    except requests.exceptions.ConnectionError:
+    except RuntimeError as e:
+        progress.close()
         return json.dumps({
-            "error": "Cannot connect to Zotero local API",
-            "note": "Ensure Zotero desktop is running with local API enabled"
+            "error": str(e),
+            "note": "Check ZOTERO_API_KEY and ZOTERO_USER_ID in .env"
         }, indent=2)
     except Exception as e:
+        progress.close()
         return json.dumps({"error": str(e)}, indent=2)
 
     # Filter to parent items only (not attachments or notes)
@@ -821,47 +1208,82 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     if force_rebuild:
         index["items"] = {}
 
-    # Get embedding model (this may download ~80MB on first run)
-    logger.info("Loading embedding model (may take 1-2 minutes on first run)...")
-    model = get_embedding_model()
-    logger.info("Embedding model loaded successfully - Starting PDF extraction\n")
-
-    # Track current item keys for cleanup
+    # Determine which items need indexing
+    items_to_index = []
     current_keys = set()
-    total_to_process = len([i for i in parent_items
-                           if not (index["items"].get(i.get("key"), {}).get("version") == i.get("version")
-                                  and not force_rebuild)])
-
-    # Track PDF extraction progress
-    pdfs_extracted = 0
-    pdfs_with_text = 0
-
-    for idx, item in enumerate(parent_items):
+    for item in parent_items:
         item_key = item.get("key")
-        item_data = item.get("data", {})
         item_version = item.get("version", 0)
-        title = item_data.get("title", "Untitled")[:50]  # Truncate for display
-
+        title = item.get("data", {}).get("title", "Untitled")[:50]
         current_keys.add(item_key)
 
-        # Check if item needs updating
         existing = index["items"].get(item_key)
         if existing and existing.get("version") == item_version and not force_rebuild:
             stats["items_skipped"] += 1
-            continue
+        else:
+            items_to_index.append((item_key, title, item))
 
-        # Extract PDF text
-        pdfs_extracted += 1
-        # Show progress every 5 items
-        if pdfs_extracted % 5 == 1 or pdfs_extracted == 1:
-            progress.update(pdfs_extracted, len(parent_items), title)
+    logger.info(f"Items to index: {len(items_to_index)}, skipped (unchanged): {stats['items_skipped']}")
 
-        pages = extract_pdf_text_with_pages(item_key)
+    if not items_to_index:
+        progress.set_status("No items need indexing!")
+        progress.close()
+        return json.dumps({
+            "message": "No items need indexing - all items are up to date",
+            "items_skipped": stats["items_skipped"],
+            "total_items_in_index": len(index["items"])
+        }, indent=2)
+
+    # Get storage path once (cached)
+    storage_path = get_zotero_storage_path()
+
+    # Clear PDF cache so we get fresh file list
+    global _pdf_file_cache
+    _pdf_file_cache = None
+
+    # Phase 1: Download PDFs to local temp folder
+    progress.set_status(f"Phase 1: Downloading {len(items_to_index)} PDFs to local temp folder...")
+    download_start = time.time()
+
+    def download_progress(current, total, title):
+        progress.update(current, total, title)
+
+    temp_dir, pdf_mapping = download_pdfs_to_temp(
+        [(key, title) for key, title, _ in items_to_index],
+        storage_path,
+        download_progress
+    )
+
+    stats["download_time"] = round(time.time() - download_start, 2)
+    stats["pdfs_downloaded"] = len(pdf_mapping)
+    logger.info(f"Downloaded {len(pdf_mapping)} PDFs in {stats['download_time']:.1f}s")
+
+    # Phase 2: Extract text and create embeddings (from local copies)
+    progress.set_status(f"Phase 2: Extracting text and creating embeddings...")
+    extract_start = time.time()
+    pdfs_with_text = 0
+    total_embed_time = 0
+
+    for idx, (item_key, title, item) in enumerate(items_to_index):
+        item_data = item.get("data", {})
+        item_version = item.get("version", 0)
+
+        progress.update(idx + 1, len(items_to_index), f"Processing: {title[:40]}")
+
+        # Extract PDF text from local copy (or try network as fallback)
+        pdf_start = time.time()
+        local_pdf = pdf_mapping.get(item_key)
+        if local_pdf:
+            pages = extract_pdf_text_from_path(local_pdf)
+        else:
+            # No local copy - item might not have a PDF
+            pages = None
+        pdf_time = time.time() - pdf_start
+
         if not pages:
             # Index metadata only (title + abstract)
             abstract = item_data.get("abstractNote", "")
             if not title and not abstract:
-                stats["items_skipped"] += 1
                 continue
 
             chunks = [{"text": f"{title}. {title}. {abstract}".strip(),
@@ -873,13 +1295,16 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
             chunks = chunk_text_with_pages(pages, title, abstract)
 
         if not chunks:
-            stats["items_skipped"] += 1
             continue
 
         # Create embeddings for all chunks
         try:
             chunk_texts = [c["text"] for c in chunks]
+
+            embed_start = time.time()
             embeddings = model.encode(chunk_texts, show_progress_bar=False)
+            embed_time = time.time() - embed_start
+            total_embed_time += embed_time
 
             # Store in index
             index["items"][item_key] = {
@@ -900,18 +1325,29 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
             stats["items_processed"] += 1
             stats["chunks_created"] += len(chunks)
 
-            if stats["items_processed"] % 5 == 0:
-                elapsed = time.time() - start_time
-                msg = f"PROGRESS: {stats['items_processed']} items indexed, {stats['chunks_created']} chunks, {elapsed:.0f}s elapsed"
-                logger.info(msg)
-                stats["status_messages"].append(msg)
+            # Log detailed timing
+            has_pdf = pages is not None
+            num_pages = len(pages) if pages else 0
+            logger.info(f"TIMING [{item_key}]: extract={pdf_time:.2f}s, embed={embed_time:.2f}s, "
+                       f"chunks={len(chunks)}, pages={num_pages}, has_pdf={has_pdf}, title={title[:30]}")
 
         except Exception as e:
             stats["items_failed"] += 1
             stats["errors"].append(f"{item_key}: {str(e)}")
             logger.error(f"Failed to embed {item_key}: {e}")
 
-    # Remove deleted items
+    stats["extract_time"] = round(time.time() - extract_start - total_embed_time, 2)
+    stats["embed_time"] = round(total_embed_time, 2)
+
+    # Phase 3: Cleanup temp folder
+    progress.set_status("Cleaning up temp folder...")
+    try:
+        shutil.rmtree(temp_dir)
+        logger.info(f"Cleaned up temp folder: {temp_dir}")
+    except Exception as e:
+        logger.warning(f"Failed to clean up temp folder: {e}")
+
+    # Remove deleted items from index
     deleted_keys = set(index["items"].keys()) - current_keys
     for key in deleted_keys:
         del index["items"][key]
@@ -927,10 +1363,11 @@ def build_semantic_index(force_rebuild: bool = False) -> str:
     stats["total_chunks_in_index"] = sum(
         len(item["chunks"]) for item in index["items"].values()
     )
-    stats["pdfs_attempted"] = pdfs_extracted
     stats["pdfs_with_text"] = pdfs_with_text
 
-    final_msg = f"COMPLETED: Indexed {stats['items_processed']} items ({pdfs_with_text} PDFs) with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s"
+    final_msg = (f"COMPLETED: Indexed {stats['items_processed']} items ({pdfs_with_text} PDFs) "
+                 f"with {stats['total_chunks_in_index']} chunks in {elapsed:.0f}s "
+                 f"(download: {stats['download_time']:.0f}s, extract: {stats['extract_time']:.0f}s, embed: {stats['embed_time']:.0f}s)")
     stats["status_messages"].append(final_msg)
     logger.info(f"\n{final_msg}\n")
     progress.close()
