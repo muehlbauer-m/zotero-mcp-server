@@ -508,17 +508,35 @@ def export_bibtex(output_path: str, collection_key: Optional[str] = None) -> str
     """
     ensure_client()
     import bibtexparser
+
+    # Fetch all item keys via JSON (reliable pagination), then request
+    # bibtex in batches of 50 (API limit for export formats).
     if collection_key:
-        bib = zot.everything(zot.collection_items(collection_key, format='bibtex'))
+        items = zot.everything(zot.collection_items(collection_key))
     else:
-        bib = zot.everything(zot.top(format='bibtex'))
-    bibtex_str = bibtexparser.dumps(bib)
+        items = zot.everything(zot.top())
+
+    item_keys = [it['key'] for it in items if it['data'].get('itemType') not in ('attachment', 'note')]
+
+    bibtex_parts = []
+    batch_size = 50
+    for i in range(0, len(item_keys), batch_size):
+        batch = item_keys[i:i + batch_size]
+        bib_chunk = zot.items(itemKey=','.join(batch), format='bibtex')
+        bibtex_parts.append(bibtexparser.dumps(bib_chunk))
+
+    bibtex_str = '\n'.join(bibtex_parts)
+
+    # Parse back to count entries
+    parser = bibtexparser.bparser.BibTexParser(common_strings=True)
+    parsed = bibtexparser.loads(bibtex_str, parser=parser)
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(bibtex_str)
     return json.dumps({
         "success": True,
         "path": output_path,
-        "entries": len(bib.entries),
+        "entries": len(parsed.entries),
         "size_bytes": len(bibtex_str.encode('utf-8'))
     })
 
