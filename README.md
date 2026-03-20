@@ -11,6 +11,7 @@ Built with the official [MCP Python SDK](https://github.com/modelcontextprotocol
 - Add new items to Zotero libraries
 - Access collections and items
 - Extract full text from PDFs (requires Zotero desktop running)
+- Export library or collection as BibTeX
 - Support for both personal and group libraries
 
 ## Installation
@@ -99,6 +100,9 @@ The Zotero MCP server can be integrated with AI applications that support the Mo
 - `delete_item`: Delete an item from the Zotero library
 - `get_item_types`: Get list of all available Zotero item types
 - `get_item_fields`: Get available fields for a specific item type
+
+### Export
+- `export_bibtex`: Export library or collection as a BibTeX file
 
 ### Full Text
 - `get_fulltext_local`: Extract full text from a PDF (requires Zotero desktop running)
