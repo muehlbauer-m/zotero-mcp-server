@@ -495,6 +495,35 @@ def add_item(
 
 
 @mcp.tool()
+def export_bibtex(output_path: str, collection_key: Optional[str] = None) -> str:
+    """
+    Export library or collection as a BibTeX file.
+
+    Args:
+        output_path: File path to write the .bib file to
+        collection_key: Optional collection key to export. If omitted, exports the entire library.
+
+    Returns:
+        JSON string with export summary (success, path, entry count)
+    """
+    ensure_client()
+    import bibtexparser
+    if collection_key:
+        bib = zot.everything(zot.collection_items(collection_key, format='bibtex'))
+    else:
+        bib = zot.everything(zot.top(format='bibtex'))
+    bibtex_str = bibtexparser.dumps(bib)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(bibtex_str)
+    return json.dumps({
+        "success": True,
+        "path": output_path,
+        "entries": len(bib.entries),
+        "size_bytes": len(bibtex_str.encode('utf-8'))
+    })
+
+
+@mcp.tool()
 def get_bibliography(item_keys: list[str], style: str = "apa") -> str:
     """
     Get bibliography for multiple items.
