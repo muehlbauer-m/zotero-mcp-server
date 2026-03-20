@@ -578,12 +578,9 @@ def delete_item(item_key: str) -> str:
     """
     ensure_client()
 
-    # Get item version for deletion
+    # Get item for deletion
     item = zot.item(item_key)
-    version = item.get('version')
-
-    # Delete the item
-    zot.delete_item(item, version=version)
+    zot.delete_item(item)
 
     return json.dumps({"success": True, "message": f"Item {item_key} deleted"})
 
