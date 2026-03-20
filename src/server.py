@@ -511,12 +511,21 @@ def export_bibtex(output_path: str, collection_key: Optional[str] = None) -> str
 
     # Fetch all item keys via JSON (reliable pagination), then request
     # bibtex in batches of 50 (API limit for export formats).
-    if collection_key:
-        items = zot.everything(zot.collection_items(collection_key))
-    else:
-        items = zot.everything(zot.top())
+    # The Zotero Web API is eventually consistent after writes.
+    # Always fetch twice with a short delay and keep the larger result.
+    import time
 
-    item_keys = [it['key'] for it in items if it['data'].get('itemType') not in ('attachment', 'note')]
+    def _fetch_keys():
+        if collection_key:
+            items = zot.everything(zot.collection_items(collection_key))
+        else:
+            items = zot.everything(zot.top())
+        return [it['key'] for it in items if it['data'].get('itemType') not in ('attachment', 'note')]
+
+    first = _fetch_keys()
+    time.sleep(1.5)
+    second = _fetch_keys()
+    item_keys = first if len(first) >= len(second) else second
 
     bibtex_parts = []
     batch_size = 50
