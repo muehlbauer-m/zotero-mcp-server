@@ -484,13 +484,12 @@ def add_item(
         for key, value in additional_fields.items():
             template[key] = value
 
+    # Assign to collection before creation
+    if collection_key:
+        template["collections"] = [collection_key]
+
     # Create item
     response = zot.create_items([template])
-
-    # Add to collection if specified
-    if collection_key and response.get("success"):
-        item_key = response["successful"]["0"]["key"]
-        zot.addto_collection(collection_key, [item_key])
 
     return json.dumps(response, indent=2)
 
