@@ -76,6 +76,78 @@ def ensure_client():
 # Cache for storage path (avoid repeated lookups)
 _cached_storage_path: Optional[str] = None
 
+# Cache for Zotero preferences parsed from prefs.js
+_cached_prefs: Optional[dict] = None
+
+
+def _find_zotero_prefs_files() -> list:
+    """Find Zotero prefs.js files across platforms (Windows/macOS/Linux)."""
+    profile_roots = [
+        Path.home() / "AppData" / "Roaming" / "Zotero" / "Zotero" / "Profiles",  # Windows
+        Path.home() / "Library" / "Application Support" / "Zotero" / "Profiles",  # macOS
+        Path.home() / ".zotero" / "zotero",  # Linux
+    ]
+    prefs_files = []
+    for root in profile_roots:
+        if not root.exists():
+            continue
+        for profile_dir in root.iterdir():
+            prefs_js = profile_dir / "prefs.js"
+            if profile_dir.is_dir() and prefs_js.exists():
+                prefs_files.append(prefs_js)
+    return prefs_files
+
+
+def _get_zotero_prefs() -> dict:
+    """
+    Read and cache string preferences from Zotero's prefs.js.
+    Returns a dict of pref name -> value (JS string escapes resolved).
+    """
+    global _cached_prefs
+    if _cached_prefs is not None:
+        return _cached_prefs
+
+    import re
+    _cached_prefs = {}
+    for prefs_js in _find_zotero_prefs_files():
+        try:
+            with open(prefs_js, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            for match in re.finditer(r'user_pref\("([^"]+)",\s*"((?:[^"\\]|\\.)*)"\)', content):
+                key, value = match.group(1), match.group(2)
+                _cached_prefs[key] = value.replace('\\\\', '\\').replace('\\"', '"')
+        except Exception as e:
+            logger.debug(f"Could not read {prefs_js}: {e}")
+
+    logger.info(f"Loaded {len(_cached_prefs)} string prefs from prefs.js")
+    return _cached_prefs
+
+
+def resolve_attachment_path(path: str, attachment_key: str = "") -> str:
+    """
+    Resolve a Zotero attachment path field to an absolute filesystem path.
+
+    Zotero stores linked-file attachments as "attachments:<relative path>"
+    (relative to the extensions.zotero.baseAttachmentPath preference) and
+    imported files as "storage:<filename>" (which live in
+    <dataDir>/storage/<ATTACHMENT_KEY>/). Absolute paths pass through unchanged.
+    """
+    if path.startswith("attachments:"):
+        base = _get_zotero_prefs().get("extensions.zotero.baseAttachmentPath", "")
+        if base:
+            resolved = str(Path(base) / path[len("attachments:"):])
+            logger.info(f"Resolved linked attachment to {resolved}")
+            return resolved
+        logger.warning("Got 'attachments:' path but no baseAttachmentPath pref found")
+    elif path.startswith("storage:"):
+        data_dir = _get_zotero_prefs().get("extensions.zotero.dataDir", "") or str(Path.home() / "Zotero")
+        if attachment_key:
+            resolved = str(Path(data_dir) / "storage" / attachment_key / path[len("storage:"):])
+            logger.info(f"Resolved stored attachment to {resolved}")
+            return resolved
+        logger.warning("Got 'storage:' path but no attachment key to resolve it with")
+    return path
+
 
 def get_zotero_storage_path() -> str:
     """
@@ -88,31 +160,14 @@ def get_zotero_storage_path() -> str:
     if _cached_storage_path is not None:
         return _cached_storage_path
 
-    # Try ZotMoov first
-    try:
-        import re
-        prefs_path = Path.home() / "AppData" / "Roaming" / "Zotero" / "Zotero" / "Profiles"
-
-        # Find the profile directory (usually like r64lmnh5.default)
-        if prefs_path.exists():
-            for profile_dir in prefs_path.iterdir():
-                if profile_dir.is_dir():
-                    prefs_js = profile_dir / "prefs.js"
-                    if prefs_js.exists():
-                        with open(prefs_js, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                            # Look for ZotMoov destination directory
-                            match = re.search(r'extensions\.zotmoov\.dst_dir["\s]*,\s*"([^"]+)"', content)
-                            if match:
-                                zotmoov_path = match.group(1)
-                                # Convert Windows path format
-                                zotmoov_path = zotmoov_path.replace('\\\\', '/').replace('\\', '/')
-                                if Path(zotmoov_path).exists():
-                                    logger.info(f"Using ZotMoov storage: {zotmoov_path}")
-                                    _cached_storage_path = zotmoov_path
-                                    return zotmoov_path
-    except Exception as e:
-        logger.debug(f"Could not get ZotMoov path: {e}")
+    # Try ZotMoov destination dir, then the linked-attachment base dir
+    prefs = _get_zotero_prefs()
+    for pref in ("extensions.zotmoov.dst_dir", "extensions.zotero.baseAttachmentPath"):
+        path = prefs.get(pref, "").replace('\\', '/')
+        if path and Path(path).exists():
+            logger.info(f"Using storage from {pref}: {path}")
+            _cached_storage_path = path
+            return path
 
     # Fall back to default Zotero storage location
     default_path = Path.home() / "Zotero" / "storage"
@@ -287,6 +342,7 @@ def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
 
         if item_type == "attachment":
             pdf_path = item_data.get("data", {}).get("path", "")
+            attachment_key = item_key
         else:
             # Find PDF attachment
             children_response = requests.get(
@@ -297,13 +353,15 @@ def extract_pdf_text_with_pages(item_key: str) -> Optional[list[dict]]:
             children = children_response.json()
 
             pdf_path = None
+            attachment_key = ""
             for child in children:
                 if child.get("data", {}).get("contentType") == "application/pdf":
                     pdf_path = child.get("data", {}).get("path", "")
+                    attachment_key = child.get("key", "")
                     break
 
         if pdf_path:
-            return extract_pdf_text_from_path(pdf_path)
+            return extract_pdf_text_from_path(resolve_attachment_path(pdf_path, attachment_key))
 
     except Exception as e:
         logger.debug(f"Failed to extract PDF for {item_key}: {e}")
@@ -701,6 +759,7 @@ def get_fulltext_local(item_key: str) -> str:
         if item_type == "attachment":
             # This is the attachment itself
             pdf_path = item_data.get("data", {}).get("path", "")
+            pdf_path = resolve_attachment_path(pdf_path, item_key) if pdf_path else pdf_path
         else:
             # This is a parent item, need to find child attachments
             children_response = requests.get(
@@ -715,6 +774,8 @@ def get_fulltext_local(item_key: str) -> str:
             for child in children:
                 if child.get("data", {}).get("contentType") == "application/pdf":
                     pdf_path = child.get("data", {}).get("path", "")
+                    if pdf_path:
+                        pdf_path = resolve_attachment_path(pdf_path, child.get("key", ""))
                     break
 
             if not pdf_path:
